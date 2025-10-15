@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Error Forecasting Pipeline — Step by Step</title>
+  <style>
+    body{font-family:Inter,Segoe UI,Arial;line-height:1.5;margin:24px;background:#f7f8fb;color:#0b1220}
+    .container{max-width:980px;margin:0 auto;background:white;padding:28px;border-radius:12px;box-shadow:0 6px 24px rgba(12,20,40,0.08)}
+    h1{font-size:24px;margin-bottom:8px}
+    h2{font-size:18px;margin-top:20px}
+    p{margin:8px 0}
+    pre{background:#0f1724;color:#e6eef8;padding:12px;border-radius:8px;overflow:auto;font-size:13px}
+    code{background:#eef2ff;padding:2px 6px;border-radius:4px}
+    .note{background:#fff7ed;border-left:4px solid #ffb020;padding:10px;border-radius:6px;margin:10px 0}
+    .badge{display:inline-block;background:#eef2ff;color:#003366;padding:4px 8px;border-radius:999px;font-size:12px;margin-left:6px}
+    ul{margin:6px 0 12px 20px}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    footer{font-size:13px;color:#475569;margin-top:18px}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Error Forecasting Pipeline — Step by Step</h1>
+    <p>A clear, single-file explanation of the end-to-end solution for forecasting satellite error signals (works for both <strong>MEO</strong> and <strong>GEO</strong>). Each step includes why it exists, how it's implemented, short code snippets and operational notes.</p>
+
+    <h2>Overview</h2>
+    <p>The pipeline follows these stages: <strong>Outlier Processing → Interpolation → Feature Engineering → Sequence Creation → Data Augmentation → Forecasting Model → Deployment</strong>. Hyperparameters (sequence length, stride, pred horizon) are tuned per-satellite (MEO vs GEO).</p>
+
+    <h2>Step 0 — Load & inspect data</h2>
+    <p>Read timestamps, values and metadata; check sampling irregularities and missing rate.</p>
+    <pre><code>import pandas as pd
+df = pd.read_csv('satellite_measurements.csv', parse_dates=['utc_time'])
+df = df.sort_values('utc_time').reset_index(drop=True)
+print(df.info())
+print('Missing ratio:', df['value'].isna().mean())</code></pre>
+
+    <h2>Step 1 — Outlier detection & handling</h2>
+    <p><strong>Why:</strong> Remove abnormal spikes before interpolation to avoid propagating artifacts.</p>
+    <p><strong>How:</strong> Rolling mean/std z-score. Replace detected outliers with <code>NaN</code> (so interpolation will fill them).</p>
+    <pre><code>def rolling_outlier_detection(series, window=24, threshold=3):
+    rm = series.rolling(window, min_periods=1, center=False).mean()
+    rs = series.rolling(window, min_periods=1, center=False).std()
+    z = (series - rm) / (rs + 1e-8)
+    series[z.abs() &gt; threshold] = np.nan
+    return series
+
+import numpy as np
+df['value_clean'] = rolling_outlier_detection(df['value'], window=24, threshold=3)</code></pre>
+
+    <h2>Step 2 — Interpolation (resample to uniform grid)</h2>
+    <p><strong>Why:</strong> Models expect uniform sampling. We use 15-minute grid by default (adjustable per satellite).</p>
+    <p><strong>How:</strong> Resample timestamps to target range and use <code>PCHIP</code> to preserve monotonicity and sharp transitions.</p>
+    <pre><code>from scipy.interpolate import PchipInterpolator
+
+def pchip_resample(df, time_col='utc_time', val_col='value_clean', freq='15T'):
+    target = pd.date_range(df[time_col].min(), df[time_col].max(), freq=freq)
+    vals = df.set_index(time_col)[val_col].reindex(target)
+    mask = ~vals.isna()
+    if mask.sum() &lt; 2:
+        return vals  # not enough points
+    interp = PchipInterpolator(target[mask].astype('int64')//10**9, vals[mask])
+    return pd.Series(interp(target.astype('int64')//10**9), index=target)
+
+series_15m = pchip_resample(df)
+</code></pre>
+
+    <h2>Step 3 — Feature engineering</h2>
+    <p><strong>Why:</strong> Add periodic and burst features to help the model capture diurnal cycles and irregular bursts.</p>
+    <pre><code>def add_time_features(series):
+    df = series.to_frame('value')
+    df = df.reset_index().rename(columns={'index':'utc_time'})
+    df['hour'] = df['utc_time'].dt.hour
+    df['sin_hour'] = np.sin(2*np.pi*df['hour']/24)
+    df['cos_hour'] = np.cos(2*np.pi*df['hour']/24)
+    df['time_diff'] = df['utc_time'].diff().dt.total_seconds().fillna(0)
+    df['burst_mask'] = (df['time_diff'] &gt; df['time_diff'].median()).astype(int)
+    df['burst_intensity'] = df['time_diff'] / (df['time_diff'].max() + 1e-6)
+    return df.set_index('utc_time')
+
+features_df = add_time_features(series_15m)
+</code></pre>
+
+    <h2>Step 4 — Sequence creation</h2>
+    <p><strong>Why:</strong> Convert continuous multivariate series into supervised (X,Y) sequences for Seq2Seq training.</p>
+    <p><strong>Satellite-specific hyperparameters:</strong>
+      <span class="badge">GEO: seq_len=96, stride=8, pred_len=96</span>
+      <span class="badge">MEO: seq_len=48, stride=12, pred_len=96</span>
+    </p>
+    <pre><code>import numpy as np
+
+def create_sequences(arr, seq_len, pred_len, stride):
+    X, Y = [], []
+    n = len(arr)
+    for i in range(0, n - seq_len - pred_len + 1, stride):
+        X.append(arr[i:i+seq_len])
+        Y.append(arr[i+seq_len:i+seq_len+pred_len])
+    return np.array(X), np.array(Y)
+
+# example
+arr = features_df.values  # shape (T, F)
+X, Y = create_sequences(arr, seq_len=96, pred_len=96, stride=8)
+</code></pre>
+
+    <h2>Step 5 — Data augmentation (TimeGAN)</h2>
+    <p><strong>Why:</strong> Expand data diversity when training samples are limited; preserve temporal coherence.</p>
+    <p><strong>How (reference):</strong> Use <code>ydata-synthetic</code> TimeGAN, validate synthetic data with statistical tests and embedding visuals.</p>
+    <pre><code>from ydata_synthetic.synthesizers import TimeGAN
+from ydata_synthetic.preprocessing.timeseries import TimeSeriesScalerMinMax
+
+scaler = TimeSeriesScalerMinMax()
+train_scaled = scaler.fit_transform(X)  # expects shape (n, seq_len, features)
+
+timegan = TimeGAN(model_parameters={'hidden_dim':24,'num_layers':3,'epochs':100})
+timegan.train(train_scaled)
+synth = scaler.inverse_transform(timegan.sample(len(train_scaled)))
+</code></pre>
+    <p class="note">Validate synthetics using t-SNE/UMAP and distributional stats (mean/std, autocorrelation). Do not blindly mix low-quality synthetic data into training.</p>
+
+    <h2>Step 6 — Forecasting model (Seq2Seq BiLSTM + Cross-Attention + GP)</h2>
+    <p><strong>Why:</strong> BiLSTM captures bidirectional context, cross-model attention models feature interactions, GP residuals provide calibrated uncertainty.</p>
+    <pre><code>import tensorflow as tf
+from tensorflow.keras import layers, Model
+
+class CrossAttention(layers.Layer):
+    def __init__(self, d_model):
+        super().__init__()
+        self.q = layers.Dense(d_model)
+        self.k = layers.Dense(d_model)
+        self.v = layers.Dense(d_model)
+    def call(self, x):
+        q,k,v = self.q(x), self.k(x), self.v(x)
+        attn = tf.nn.softmax(tf.matmul(q, k, transpose_b=True)/tf.sqrt(tf.cast(tf.shape(k)[-1], tf.float32)))
+        return tf.matmul(attn, v)
+
+inp = layers.Input((None, arr.shape[1]))
+enc = layers.Bidirectional(layers.LSTM(128, return_sequences=True))(inp)
+ctx = CrossAttention(256)(enc)
+dec = layers.LSTM(128, return_sequences=True)(ctx)
+out = layers.Dense(arr.shape[1])(dec)
+model = Model(inp, out)
+model.compile(optimizer='adam', loss='mse')
+</code></pre>
+    <p>Note: GP residual layer is typically applied on the <em>residuals</em> of this model during training or used as a post-hoc uncertainty estimator. Use sparse/variational GP for scale.</p>
+
+    <h2>Training & validation</h2>
+    <ul>
+      <li>Use walk-forward cross-validation (time-based splits) not random K-folds.</li>
+      <li>Metrics: MAE, RMSE, and NLL (for uncertainty).</li>
+      <li>Monitor residual distribution and calibration plots (PIT, reliability diagrams).</li>
+    </ul>
+
+    <h2>Deployment notes</h2>
+    <ul>
+      <li>For inference, consider removing GP or replacing with a lightweight uncertainty estimator if latency matters.</li>
+      <li>Bundle preprocessing into a pipeline (scaler, interpolation, feature creation) so input data can be processed consistently.</li>
+      <li>For large datasets, use Dask or batch processing to handle rolling and interpolation at scale.</li>
+    </ul>
+
+    <h2>Limitations & mitigations</h2>
+    <ul>
+      <li>GP scaling — use sparse variational GP or limit GP to short residual windows.</li>
+      <li>TimeGAN instability — early-stop, monitor divergence, and validate synthetic data quality before use.</li>
+      <li>Interpolation risk in extremely sparse segments — fallback to model-based imputation or mark as "untrustworthy".</li>
+    </ul>
+
+    <h2>Quick checklist before running</h2>
+    <ol>
+      <li>Decide target sampling rate (GEO often 15min; MEO may use 5–15min depending on orbit)</li>
+      <li>Choose hyperparameters per satellite (seq_len, pred_len, stride)</li>
+      <li>Validate TimeGAN output before mixing</li>
+      <li>Test with walk-forward CV and record MAE/RMSE/NLL</li>
+    </ol>
+
+    <footer>
+      Prepared automatically — adapt code and hyperparameters to your dataset. For a runnable notebook with full experiments and plots, ask and I will generate it next.
+    </footer>
+  </div>
+</body>
+</html>
