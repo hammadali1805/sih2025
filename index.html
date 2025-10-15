@@ -10,8 +10,22 @@
     h1{font-size:24px;margin-bottom:8px}
     h2{font-size:18px;margin-top:20px}
     p{margin:8px 0}
-    pre{background:#0f1724;color:#e6eef8;padding:12px;border-radius:8px;overflow:auto;font-size:13px}
-    code{background:#eef2ff;padding:2px 6px;border-radius:4px}
+    pre {
+      background:#1e1e2f;        /* softer dark tone */
+      color:#f8f8f2;             /* bright readable text */
+      padding:14px;
+      border-radius:10px;
+      overflow-x:auto;
+      font-size:13px;
+      line-height:1.6;
+    }
+    code {
+      background:#2c2c3a;        /* darker inline code background */
+      color:#f8f8f2;             /* same as code text */
+      padding:2px 6px;
+      border-radius:4px;
+      font-family:'Fira Code', monospace;
+    }
     .note{background:#fff7ed;border-left:4px solid #ffb020;padding:10px;border-radius:6px;margin:10px 0}
     .badge{display:inline-block;background:#eef2ff;color:#003366;padding:4px 8px;border-radius:999px;font-size:12px;margin-left:6px}
     ul{margin:6px 0 12px 20px}
@@ -173,7 +187,7 @@ model.compile(optimizer='adam', loss='mse')
     </ol>
 
     <footer>
-      Prepared automatically — adapt code and hyperparameters to your dataset. For a runnable notebook with full experiments and plots, ask and I will generate it next.
+      Thank You
     </footer>
   </div>
 </body>
